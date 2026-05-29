@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,54 +30,97 @@ type ServerPool struct {
 
 func main() {
     // 1. Define your multiple backend ports
-    rawBackends := []string{
-        "https://localhost:8080",
-        "https://localhost:8081",
-        "https://localhost:8082",
+    // rawBackends := []string{
+    //     "https://localhost:8080",
+    //     "https://localhost:8081",
+    //     "https://localhost:8082",
+    // }
+
+	routes := make(map[string]*ServerPool)
+
+    routes["/users"]=&ServerPool{
+        backends: []*Backend{
+            {URL: parseURL("https://localhost:8082"), IsAlive: true},
+        },
     }
+
+    routes["/product"]=&ServerPool{
+        backends: []*Backend{
+            {URL: parseURL("https://localhost:8081"),IsAlive: true},
+        },
+    }
+    routes["/data"]=&ServerPool{
+        backends: []*Backend{
+            {URL: parseURL("https://localhost:8080"),IsAlive: true},
+        },
+    }
+
     // Parse them into actual url.URL objects
-    var initialBackends []*Backend
-    for _, raw := range rawBackends {
-        parsed, err := url.Parse(raw)
-        if err != nil {
-            log.Fatalf("Invalid backend URL %s: %v", raw, err)
-        }
-        initialBackends = append(initialBackends, &Backend{
-			URL:parsed,
-			IsAlive: true,
-		})
+    // var initialBackends []*Backend
+    // for _, raw := range rawBackends {
+    //     parsed, err := url.Parse(raw)
+    //     if err != nil {
+    //         log.Fatalf("Invalid backend URL %s: %v", raw, err)
+    //     }
+    //     initialBackends = append(initialBackends, &Backend{
+	// 		URL:parsed,
+	// 		IsAlive: true,
+	// 	})
+    // }
+
+    // // 2. Create a thread-safe counter for Round-Robin routing
+    // // atomic.Uint64 is safe to use across thousands of concurrent requests 
+	// pool:=&ServerPool{
+	// 	backends: initialBackends,
+	// }
+
+	for path, pool := range routes {
+        log.Printf("Starting health checks for %s...", path)
+        go pool.healthCheck() 
     }
 
-    // 2. Create a thread-safe counter for Round-Robin routing
-    // atomic.Uint64 is safe to use across thousands of concurrent requests 
-	pool:=&ServerPool{
-		backends: initialBackends,
-	}
-
-	go pool.healthCheck()
 
     // 3. Initialize the ReverseProxy
     proxy := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetXForwarded()
-			
-			var targetURL *url.URL
-		
-			backend:=pool.GetNextPeer();
+        pr.SetXForwarded()
+        
+        var targetURL *url.URL
+        var activePool *ServerPool
 
-			targetURL=backend.URL;
+        // 1. Iterate through routes to find a matching prefix
+        for prefix, pool := range routes {
+            if strings.HasPrefix(pr.In.URL.Path, prefix) {
+                activePool = pool
+                break // Found our route, stop searching
+            }
+        }
 
-			if targetURL == nil {
-				log.Println("CRITICAL: All backends are dead!")
-				// Give the proxy a safe dummy URL so it doesn't crash with the scheme error
-				dummyURL, _ := url.Parse("http://0.0.0.0")
-				pr.SetURL(dummyURL)
-				return 
-			}
-			
-			pr.SetURL(targetURL)
-			log.Printf("Proxying %s request to backend: %s", pr.In.Method, targetURL.Host)
-    	},
+        // 2. Handle the case where the route doesn't exist (e.g., /unknown)
+        if activePool == nil {
+            log.Printf("404 Not Found: No route matches path %s", pr.In.URL.Path)
+            // Route to a dummy URL so it safely hits your ErrorHandler or a custom 404 handler
+            dummyURL, _ := url.Parse("http://0.0.0.0")
+            pr.SetURL(dummyURL)
+            return
+        }
+
+        // 3. Get the next backend from the matched pool
+        backend := activePool.GetNextPeer()
+        if backend != nil {
+            targetURL = backend.URL
+        }
+
+        if targetURL == nil {
+            log.Printf("CRITICAL: All backends are dead for path %s!", pr.In.URL.Path)
+            dummyURL, _ := url.Parse("http://0.0.0.0")
+            pr.SetURL(dummyURL)
+            return 
+        }
+        
+        pr.SetURL(targetURL)
+        log.Printf("Proxying %s %s to backend: %s", pr.In.Method, pr.In.URL.Path, targetURL.Host)
+    },
 
 		Transport: &http.Transport{
             TLSClientConfig: &tls.Config{
